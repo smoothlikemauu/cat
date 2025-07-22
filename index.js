@@ -774,8 +774,8 @@ client.on('messageCreate', async (message) => {
     if (message.mentions.users.size > 0) {
         try {
             for (const [userId, user] of message.mentions.users) {
-                // Skip if mentioning bot or the special user ID in the existing ping handler
-                if (user.bot || userId === client.user.id || userId === '1021122042302562375') continue;
+                // Skip if mentioning bot
+                if (user.bot || userId === client.user.id) continue;
                 
                 const afkResult = await pgClient.query('SELECT * FROM afk_users WHERE user_id = $1', [userId]);
                 

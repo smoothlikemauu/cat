@@ -84,6 +84,13 @@ client.once('ready', async () => {
         PRIMARY KEY (guild_id, role_id)
     )`);
 
+    // Create afk_ignore_users table if not exists
+    await pgClient.query(`CREATE TABLE IF NOT EXISTS afk_ignore_users (
+        guild_id VARCHAR(32),
+        user_id VARCHAR(32),
+        PRIMARY KEY (guild_id, user_id)
+    )`);
+
     const commands = [
         new SlashCommandBuilder().setName('play').setDescription('Plays a song from YouTube').addStringOption(option => option.setName('query').setDescription('The YouTube URL').setRequired(true)),
         new SlashCommandBuilder().setName('skip').setDescription('Skips the current song'),
@@ -144,10 +151,43 @@ client.once('ready', async () => {
             .setDescription('Set your AFK status')
             .addStringOption(option => option.setName('reason').setDescription('Reason for being AFK').setRequired(false))
             .addBooleanOption(option => option.setName('permanent').setDescription('Set permanent AFK (Admin only)').setRequired(false))
-            .addRoleOption(option => option.setName('ignore_role').setDescription('Role to ignore AFK messages (Admin only)').setRequired(false)),
+            .addRoleOption(option => option.setName('ignore_role').setDescription('Role to ignore AFK messages (Admin only)').setRequired(false))
+            .addUserOption(option => option.setName('ignore_user').setDescription('User to ignore AFK messages (Admin only)').setRequired(false)),
         new SlashCommandBuilder()
             .setName('unafk')
             .setDescription('Remove your AFK status'),
+        new SlashCommandBuilder()
+            .setName('afkignore')
+            .setDescription('Manage AFK ignore list for roles and users')
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('add-role')
+                    .setDescription('Add a role to AFK ignore list')
+                    .addRoleOption(option => option.setName('role').setDescription('Role to add').setRequired(true))
+            )
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('remove-role')
+                    .setDescription('Remove a role from AFK ignore list')
+                    .addRoleOption(option => option.setName('role').setDescription('Role to remove').setRequired(true))
+            )
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('add-user')
+                    .setDescription('Add a user to AFK ignore list')
+                    .addUserOption(option => option.setName('user').setDescription('User to add').setRequired(true))
+            )
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('remove-user')
+                    .setDescription('Remove a user from AFK ignore list')
+                    .addUserOption(option => option.setName('user').setDescription('User to remove').setRequired(true))
+            )
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('list')
+                    .setDescription('List all AFK ignore roles and users')
+            ),
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(token);
@@ -668,6 +708,7 @@ client.on('interactionCreate', async (interaction) => {
             const timestamp = Date.now();
             const requestedPermanent = options.getBoolean('permanent') || false;
             const ignoreRole = options.getRole('ignore_role');
+            const ignoreUser = options.getUser('ignore_user');
             
             // Check if user can set permanent AFK (admin only)
             let isPermanent = false;
@@ -697,6 +738,24 @@ client.on('interactionCreate', async (interaction) => {
                 }
             }
             
+            // Handle ignore user (admin only)
+            if (ignoreUser) {
+                if (!member.permissions.has('Administrator')) {
+                    return await interaction.editReply('❌ Only administrators can set AFK ignore users.');
+                }
+                
+                try {
+                    // Check if user already exists
+                    const existing = await pgClient.query('SELECT * FROM afk_ignore_users WHERE guild_id = $1 AND user_id = $2', [guild.id, ignoreUser.id]);
+                    
+                    if (existing.rows.length === 0) {
+                        await pgClient.query('INSERT INTO afk_ignore_users (guild_id, user_id) VALUES ($1, $2)', [guild.id, ignoreUser.id]);
+                    }
+                } catch (error) {
+                    console.error('❌ AFK ignore user error:', error);
+                }
+            }
+            
             try {
                 await pgClient.query(
                     'INSERT INTO afk_users (user_id, reason, timestamp, is_permanent) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason, timestamp = EXCLUDED.timestamp, is_permanent = EXCLUDED.is_permanent',
@@ -709,6 +768,10 @@ client.on('interactionCreate', async (interaction) => {
                 
                 if (ignoreRole) {
                     afkMessage += `\n*Added **${ignoreRole.name}** to AFK ignore list*`;
+                }
+                
+                if (ignoreUser) {
+                    afkMessage += `\n*Added **${ignoreUser.username}** to AFK ignore list*`;
                 }
                     
                 await interaction.editReply(afkMessage);
@@ -747,13 +810,13 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.deferReply({ flags: 1 << 6 }); // ephemeral
             
             if (!member.permissions.has('Administrator')) {
-                return await interaction.editReply('❌ Only administrators can manage AFK ignore roles.');
+                return await interaction.editReply('❌ Only administrators can manage AFK ignore list.');
             }
             
             const subcommand = options.getSubcommand();
             
             try {
-                if (subcommand === 'add') {
+                if (subcommand === 'add-role') {
                     const role = options.getRole('role');
                     
                     // Check if role already exists
@@ -766,7 +829,7 @@ client.on('interactionCreate', async (interaction) => {
                     await pgClient.query('INSERT INTO afk_ignore_roles (guild_id, role_id) VALUES ($1, $2)', [guild.id, role.id]);
                     await interaction.editReply(`✅ Added **${role.name}** to AFK ignore list. Users with this role won't see AFK messages when they ping AFK users.`);
                     
-                } else if (subcommand === 'remove') {
+                } else if (subcommand === 'remove-role') {
                     const role = options.getRole('role');
                     
                     const result = await pgClient.query('DELETE FROM afk_ignore_roles WHERE guild_id = $1 AND role_id = $2', [guild.id, role.id]);
@@ -777,28 +840,70 @@ client.on('interactionCreate', async (interaction) => {
                     
                     await interaction.editReply(`✅ Removed **${role.name}** from AFK ignore list.`);
                     
-                } else if (subcommand === 'list') {
-                    const result = await pgClient.query('SELECT role_id FROM afk_ignore_roles WHERE guild_id = $1', [guild.id]);
+                } else if (subcommand === 'add-user') {
+                    const user = options.getUser('user');
                     
-                    if (result.rows.length === 0) {
-                        return await interaction.editReply('📋 No roles are currently in the AFK ignore list.');
+                    // Check if user already exists
+                    const existing = await pgClient.query('SELECT * FROM afk_ignore_users WHERE guild_id = $1 AND user_id = $2', [guild.id, user.id]);
+                    
+                    if (existing.rows.length > 0) {
+                        return await interaction.editReply(`❌ User **${user.username}** is already in the AFK ignore list.`);
                     }
                     
-                    let roleList = '📋 **AFK Ignore Roles:**\n';
-                    for (const row of result.rows) {
-                        const role = guild.roles.cache.get(row.role_id);
-                        if (role) {
-                            roleList += `• ${role.name}\n`;
-                        } else {
-                            roleList += `• <Deleted Role: ${row.role_id}>\n`;
+                    await pgClient.query('INSERT INTO afk_ignore_users (guild_id, user_id) VALUES ($1, $2)', [guild.id, user.id]);
+                    await interaction.editReply(`✅ Added **${user.username}** to AFK ignore list. This user won't see AFK messages when they ping AFK users.`);
+                    
+                } else if (subcommand === 'remove-user') {
+                    const user = options.getUser('user');
+                    
+                    const result = await pgClient.query('DELETE FROM afk_ignore_users WHERE guild_id = $1 AND user_id = $2', [guild.id, user.id]);
+                    
+                    if (result.rowCount === 0) {
+                        return await interaction.editReply(`❌ User **${user.username}** is not in the AFK ignore list.`);
+                    }
+                    
+                    await interaction.editReply(`✅ Removed **${user.username}** from AFK ignore list.`);
+                    
+                } else if (subcommand === 'list') {
+                    const rolesResult = await pgClient.query('SELECT role_id FROM afk_ignore_roles WHERE guild_id = $1', [guild.id]);
+                    const usersResult = await pgClient.query('SELECT user_id FROM afk_ignore_users WHERE guild_id = $1', [guild.id]);
+                    
+                    if (rolesResult.rows.length === 0 && usersResult.rows.length === 0) {
+                        return await interaction.editReply('📋 No roles or users are currently in the AFK ignore list.');
+                    }
+                    
+                    let list = '📋 **AFK Ignore List:**\n\n';
+                    
+                    if (rolesResult.rows.length > 0) {
+                        list += '**Roles:**\n';
+                        for (const row of rolesResult.rows) {
+                            const role = guild.roles.cache.get(row.role_id);
+                            if (role) {
+                                list += `• ${role.name}\n`;
+                            } else {
+                                list += `• <Deleted Role: ${row.role_id}>\n`;
+                            }
+                        }
+                        list += '\n';
+                    }
+                    
+                    if (usersResult.rows.length > 0) {
+                        list += '**Users:**\n';
+                        for (const row of usersResult.rows) {
+                            try {
+                                const user = await client.users.fetch(row.user_id);
+                                list += `• ${user.username}\n`;
+                            } catch {
+                                list += `• <Unknown User: ${row.user_id}>\n`;
+                            }
                         }
                     }
                     
-                    await interaction.editReply(roleList);
+                    await interaction.editReply(list);
                 }
             } catch (error) {
                 console.error('❌ AFK ignore command error:', error);
-                await interaction.editReply('❌ Failed to manage AFK ignore roles. Please try again.');
+                await interaction.editReply('❌ Failed to manage AFK ignore list. Please try again.');
             }
             return;
         }
@@ -873,16 +978,23 @@ client.on('messageCreate', async (message) => {
     // AFK System - Check if mentioned users are AFK
     if (message.mentions.users.size > 0) {
         try {
-            // Check if the message author has any ignore roles
+            // Check if the message author has any ignore roles or is an ignored user
             const member = message.guild.members.cache.get(message.author.id);
             let shouldIgnoreAFK = false;
             
             if (member) {
+                // Check ignore roles
                 const ignoreRolesResult = await pgClient.query('SELECT role_id FROM afk_ignore_roles WHERE guild_id = $1', [message.guild.id]);
                 const ignoreRoleIds = ignoreRolesResult.rows.map(row => row.role_id);
                 
                 // Check if user has any of the ignore roles
                 shouldIgnoreAFK = member.roles.cache.some(role => ignoreRoleIds.includes(role.id));
+                
+                // If not ignored by role, check if user is specifically ignored
+                if (!shouldIgnoreAFK) {
+                    const ignoreUsersResult = await pgClient.query('SELECT user_id FROM afk_ignore_users WHERE guild_id = $1 AND user_id = $2', [message.guild.id, message.author.id]);
+                    shouldIgnoreAFK = ignoreUsersResult.rows.length > 0;
+                }
             }
             
             if (!shouldIgnoreAFK) {
